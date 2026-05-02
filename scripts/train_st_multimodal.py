@@ -4,6 +4,7 @@ import json
 import os
 import random
 import sys
+from contextlib import nullcontext
 from io import BytesIO
 from importlib import metadata
 from typing import Any, Dict, Optional
@@ -28,17 +29,22 @@ except ImportError:
     from sentence_transformers.training_args import SentenceTransformerTrainingArguments
 
 try:
-    from sentence_transformers.evaluation import InformationRetrievalEvaluator
+    from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
 except ImportError:
     from sentence_transformers.evaluation import InformationRetrievalEvaluator
 
 try:
-    from sentence_transformers.losses import CachedMultipleNegativesRankingLoss, MatryoshkaLoss
+    from sentence_transformers.sentence_transformer.losses import CachedMultipleNegativesRankingLoss, MatryoshkaLoss
 except ImportError:
     from sentence_transformers.losses import CachedMultipleNegativesRankingLoss, MatryoshkaLoss
 
 try:
-    from sentence_transformers.training_args import BatchSamplers
+    from sentence_transformers.sentence_transformer.losses.cached_multiple_negatives_ranking import RandContext, _create_minibatch
+except ImportError:
+    from sentence_transformers.sentence_transformer.losses.cached_multiple_negatives_ranking import RandContext, _create_minibatch
+
+try:
+    from sentence_transformers.sentence_transformer.training_args import BatchSamplers
 except ImportError:
     from sentence_transformers.training_args import BatchSamplers
 
@@ -54,6 +60,43 @@ class NativeSentenceTransformerTrainer(SentenceTransformerTrainer):
         # In this container, that path trips over torchvision JPEG decoding before training starts.
         # Skipping the callback keeps training functional and does not affect optimization.
         return
+
+
+class NativeCachedMultipleNegativesRankingLoss(CachedMultipleNegativesRankingLoss):
+    @staticmethod
+    def _prune_empty_multimodal_tensors(sentence_feature_minibatch: Dict[str, Any]) -> Dict[str, Any]:
+        pruned = dict(sentence_feature_minibatch)
+
+        for grid_key, pixel_key, count_key in (
+            ("image_grid_thw", "pixel_values", "num_images_per_sample"),
+            ("video_grid_thw", "pixel_values_videos", "num_videos_per_sample"),
+        ):
+            grid = pruned.get(grid_key)
+            if getattr(grid, "numel", lambda: 0)() == 0:
+                pruned.pop(grid_key, None)
+                pruned.pop(pixel_key, None)
+                pruned.pop(count_key, None)
+
+        return pruned
+
+    def embed_minibatch(
+        self,
+        sentence_feature: dict[str, torch.Tensor],
+        begin: int,
+        end: int,
+        with_grad: bool,
+        copy_random_state: bool,
+        random_state: RandContext | None = None,
+    ):
+        grad_context = nullcontext if with_grad else torch.no_grad
+        random_state_context = nullcontext() if random_state is None else random_state
+        sentence_feature_minibatch = _create_minibatch(sentence_feature, begin, end)
+        sentence_feature_minibatch = self._prune_empty_multimodal_tensors(sentence_feature_minibatch)
+        with random_state_context:
+            with grad_context():
+                random_state = RandContext(*sentence_feature_minibatch.values()) if copy_random_state else None
+                reps = self.model(sentence_feature_minibatch)["sentence_embedding"]
+        return reps, random_state
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -135,7 +178,7 @@ def build_loss(model: SentenceTransformer, cfg: Dict[str, Any]):
     if loss_type != "cached_mnrl":
         raise ValueError(f"Unsupported loss type for native trainer path: {loss_type}")
 
-    loss = CachedMultipleNegativesRankingLoss(
+    loss = NativeCachedMultipleNegativesRankingLoss(
         model,
         scale=float(loss_cfg.get("scale", 20.0)),
         mini_batch_size=int(loss_cfg.get("mini_batch_size", 1)),
@@ -180,6 +223,9 @@ def build_training_args(cfg: Dict[str, Any]) -> SentenceTransformerTrainingArgum
     mixed_precision = str(training_cfg.get("mixed_precision", "bf16")).lower()
     eval_enabled = bool(cfg.get("validation", {}).get("manifest_path"))
     max_steps = training_cfg.get("max_steps")
+    warmup_steps = training_cfg.get("warmup_steps")
+    if warmup_steps is None:
+        warmup_steps = float(training_cfg.get("warmup_ratio", 0.0))
 
     args = SentenceTransformerTrainingArguments(
         output_dir=cfg["output_dir"],
@@ -190,7 +236,7 @@ def build_training_args(cfg: Dict[str, Any]) -> SentenceTransformerTrainingArgum
         gradient_accumulation_steps=int(training_cfg.get("grad_accum_steps", 1)),
         learning_rate=float(training_cfg["learning_rate"]),
         weight_decay=float(training_cfg.get("weight_decay", 0.01)),
-        warmup_ratio=float(training_cfg.get("warmup_ratio", 0.0)),
+        warmup_steps=float(warmup_steps),
         max_grad_norm=float(training_cfg.get("max_grad_norm", 1.0)),
         dataloader_num_workers=int(training_cfg.get("num_workers", 4)),
         batch_sampler=BatchSamplers.NO_DUPLICATES,
@@ -245,7 +291,33 @@ def normalize_st_input(value: Any) -> Any:
 def build_data_collator(model: SentenceTransformer) -> BaseDataCollator:
     def preprocess_fn(inputs, prompt=None, task=None):
         normalized_inputs = [normalize_st_input(item) for item in inputs]
-        return model.preprocess(normalized_inputs, prompt=prompt, task=task)
+        preprocessed = model.preprocess(normalized_inputs, prompt=prompt, task=task)
+
+        num_images_per_sample = []
+        num_videos_per_sample = []
+        has_images = False
+        has_videos = False
+        for item in normalized_inputs:
+            if isinstance(item, dict):
+                image_value = item.get("image")
+                video_value = item.get("video")
+            else:
+                image_value = None
+                video_value = None
+
+            image_count = 0 if image_value is None else (len(image_value) if isinstance(image_value, list) else 1)
+            video_count = 0 if video_value is None else (len(video_value) if isinstance(video_value, list) else 1)
+            num_images_per_sample.append(image_count)
+            num_videos_per_sample.append(video_count)
+            has_images = has_images or image_count > 0
+            has_videos = has_videos or video_count > 0
+
+        if has_images:
+            preprocessed["num_images_per_sample"] = torch.tensor(num_images_per_sample, dtype=torch.long)
+        if has_videos:
+            preprocessed["num_videos_per_sample"] = torch.tensor(num_videos_per_sample, dtype=torch.long)
+
+        return preprocessed
 
     return BaseDataCollator(preprocess_fn=preprocess_fn)
 
