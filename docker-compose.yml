@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hf-st-mm-server:latest
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    ipc: host
+    shm_size: "64gb"
+    security_opt:
+      - seccomp:unconfined
+    working_dir: /workspace/app
+    volumes:
+      - .:/workspace/app
+      - /scratch:/scratch
+      - /root/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HSA_ENABLE_SDMA=0
+      - GPU_MAX_HEAP_SIZE=100
+      - GPU_MAX_ALLOC_PERCENT=100
+      - MIOPEN_FIND_MODE=3
+      - NCCL_ALGO=Ring
+      - NCCL_PROTO=Simple
+      - NCCL_TIMEOUT=3600
+      - RCCL_TIMEOUT=3600
+      - TRANSFORMERS_VERBOSITY=error
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+      - HF_HOME=/root/.cache/huggingface
+    command: bash
+

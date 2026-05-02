@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+checkpoints/
+*.pt
+*.bin
+.cache/

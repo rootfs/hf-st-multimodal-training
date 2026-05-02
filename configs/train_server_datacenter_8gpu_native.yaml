@@ -1,0 +1,46 @@
+seed: 42
+output_dir: /scratch/hf_st_mm_outputs/server_datacenter_8gpu
+
+model:
+  model_name: Qwen/Qwen3-VL-Embedding-2B
+  trust_remote_code: true
+  max_text_length: 32768
+  truncate_dim: 1024
+  model_kwargs:
+    torch_dtype: bfloat16
+  processor_kwargs:
+    min_pixels: 784
+    max_pixels: 360000
+
+training:
+  epochs: 10
+  batch_size: 12
+  grad_accum_steps: 8
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  num_workers: 4
+  log_every: 10
+  save_every: 2000
+  save_total_limit: 2
+  eval_every: 2000
+
+loss:
+  type: cached_mnrl
+  scale: 20.0
+  mini_batch_size: 1
+  matryoshka_dims: [2048, 1536, 1024, 512, 256, 128, 64]
+
+data:
+  manifest_path: /scratch/2dmse-data/server_full/train_manifest.jsonl
+  image_root: /scratch/2dmse-data/server_full/images
+  audio_root: /scratch/2dmse-data/server_full/audio
+  allow_missing_negative: true
+  allowed_modalities: [text, image]
+
+validation:
+  manifest_path: /scratch/2dmse-data/server_full/val_manifest.jsonl
+  batch_size: 1
+  name: server-datacenter-native-ir

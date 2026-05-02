@@ -1,0 +1,35 @@
+seed: 42
+output_dir: /scratch/hf_st_mm_outputs/server
+
+model:
+  text_encoder_name: llm-semantic-router/mmbert-embed-32k-2d-matryoshka
+  image_encoder_name: google/siglip2-so400m-patch14-384
+  audio_encoder_name: openai/whisper-medium
+  embedding_dim: 768
+  max_text_length: 32768
+
+training:
+  epochs: 3
+  batch_size: 16
+  grad_accum_steps: 8
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  log_every: 10
+  save_every: 1000
+  hard_negative_ratio: 0.3
+
+loss:
+  type: cached_mnrl
+  scale: 20.0
+
+data:
+  manifest_path: /scratch/2dmse-data/server/train_manifest.jsonl
+  image_root: /scratch/2dmse-data/server/images
+  audio_root: /scratch/2dmse-data/server/audio
+  allow_missing_negative: true
+
+validation:
+  manifest_path: /scratch/2dmse-data/server/val_manifest.jsonl
