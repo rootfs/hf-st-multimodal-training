@@ -239,6 +239,35 @@ Original datacenter tri-encoder launch:
 docker compose run --rm trainer bash -lc "accelerate launch --config_file /workspace/app/configs/accelerate_8gpu.yaml /workspace/app/scripts/train_st_multimodal.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml"
 ```
 
+## Evaluating checkpoints and final models
+
+The standalone repo includes a dedicated evaluator for the datacenter tri-encoder path:
+
+```bash
+docker compose run --rm trainer bash -lc "python /workspace/app/scripts/evaluate_tri_encoder.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml --checkpoint-dir /scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder/checkpoint-2000"
+```
+
+Final exported model evaluation:
+
+```bash
+docker compose run --rm trainer bash -lc "python /workspace/app/scripts/evaluate_tri_encoder.py --final-dir /scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder/final"
+```
+
+Quick smoke evaluation on a small validation slice:
+
+```bash
+docker compose run --rm trainer bash -lc "python /workspace/app/scripts/evaluate_tri_encoder.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml --checkpoint-dir /scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder/checkpoint-2000 --max-samples 32"
+```
+
+Notes:
+
+- `checkpoint-*` evaluation reads the `model.safetensors` written by Accelerate checkpointing
+- `final/` evaluation reads `final/model.pt` and its neighboring `config.json`
+- checkpoint directories do not carry the original training YAML, so pass `--config` when using `--checkpoint-dir`
+- final export evaluation can omit `--config` because it loads `final/config.json` automatically
+- `--max-samples` is useful for quick checkpoint sanity checks before running a full cached validation pass
+- both modes run the same cached validation retrieval metrics used by the tri-encoder training path: `eval_loss` and `eval_top1`
+
 ## Notes for MI300X
 
 - Compose mounts `/dev/kfd` and `/dev/dri` and uses `ipc: host` with `shm_size: 64gb`.
