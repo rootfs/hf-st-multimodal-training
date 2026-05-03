@@ -1,9 +1,30 @@
 #!/usr/bin/env python3
+import os
+import sys
+
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+
+def _is_primary_process() -> bool:
+    for env_name in ("ACCELERATE_PROCESS_INDEX", "RANK", "LOCAL_RANK"):
+        env_value = os.environ.get(env_name)
+        if env_value is not None:
+            return env_value in {"0", "-1"}
+    return True
+
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(line_buffering=True, write_through=True)
+
+if _is_primary_process():
+    print("[bootstrap] importing trainer dependencies", file=sys.stderr, flush=True)
+
 import argparse
 import json
-import os
+import math
 import random
-import sys
 from contextlib import nullcontext
 from io import BytesIO
 from importlib import metadata
@@ -11,6 +32,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import yaml
+from datasets import IterableDataset as HFIterableDataset
 from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -54,12 +76,39 @@ except ImportError:
     from sentence_transformers.base.data_collator import BaseDataCollator
 
 
+def configure_unbuffered_output() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True, write_through=True)
+
+
+def log_progress(message: str) -> None:
+    if _is_primary_process():
+        print(message, flush=True)
+
+
 class NativeSentenceTransformerTrainer(SentenceTransformerTrainer):
     def add_model_card_callback(self, default_args_dict: Dict[str, Any]) -> None:
         # Sentence Transformers eagerly inspects dataset examples for model-card metadata.
         # In this container, that path trips over torchvision JPEG decoding before training starts.
         # Skipping the callback keeps training functional and does not affect optimization.
         return
+
+    def get_train_dataloader(self):
+        if self.train_dataset is None:
+            raise ValueError(f"Training requires specifying a train_dataset to the {self.__class__.__name__}.")
+
+        self.accelerator.even_batches = False
+        if isinstance(self.train_dataset, HFIterableDataset):
+            self.accelerator.dataloader_config.dispatch_batches = False
+            self.accelerator.dataloader_config.split_batches = False
+
+        self._train_dataloader = self.accelerator.prepare(
+            self._build_dataloader(self.train_dataset, self.args.train_batch_size, dataset_kind="train")
+        )
+        return self._train_dataloader
 
 
 class NativeCachedMultipleNegativesRankingLoss(CachedMultipleNegativesRankingLoss):
@@ -220,6 +269,7 @@ def build_evaluator(eval_dataset, cfg: Dict[str, Any]) -> Optional[InformationRe
 
 def build_training_args(cfg: Dict[str, Any]) -> SentenceTransformerTrainingArguments:
     training_cfg = cfg["training"]
+    use_iterable_dataset = bool(cfg.get("data", {}).get("use_iterable_dataset", False))
     mixed_precision = str(training_cfg.get("mixed_precision", "bf16")).lower()
     eval_enabled = bool(cfg.get("validation", {}).get("manifest_path"))
     max_steps = training_cfg.get("max_steps")
@@ -239,12 +289,15 @@ def build_training_args(cfg: Dict[str, Any]) -> SentenceTransformerTrainingArgum
         warmup_steps=float(warmup_steps),
         max_grad_norm=float(training_cfg.get("max_grad_norm", 1.0)),
         dataloader_num_workers=int(training_cfg.get("num_workers", 4)),
-        batch_sampler=BatchSamplers.NO_DUPLICATES,
+        dataloader_drop_last=bool(training_cfg.get("drop_last", True)),
+        batch_sampler=BatchSamplers.BATCH_SAMPLER if use_iterable_dataset else BatchSamplers.NO_DUPLICATES,
+        accelerator_config={"dispatch_batches": False} if use_iterable_dataset else None,
         save_strategy="steps",
         save_steps=int(training_cfg.get("save_every", 1000)),
         save_total_limit=int(training_cfg.get("save_total_limit", 2)),
         logging_strategy="steps",
         logging_steps=int(training_cfg.get("log_every", 10)),
+        logging_first_step=True,
         eval_strategy="steps" if eval_enabled else "no",
         eval_steps=int(training_cfg.get("eval_every", training_cfg.get("save_every", 1000))) if eval_enabled else None,
         fp16=mixed_precision == "fp16",
@@ -252,13 +305,49 @@ def build_training_args(cfg: Dict[str, Any]) -> SentenceTransformerTrainingArgum
         seed=int(cfg.get("seed", 42)),
         remove_unused_columns=False,
         run_name=training_cfg.get("run_name"),
+        disable_tqdm=False,
     )
     return args
+
+
+def resolve_training_max_steps(cfg: Dict[str, Any], train_info: Dict[str, Any]) -> Optional[int]:
+    training_cfg = cfg["training"]
+    explicit_max_steps = training_cfg.get("max_steps")
+    if explicit_max_steps is not None:
+        return int(explicit_max_steps)
+
+    if not bool(cfg.get("data", {}).get("use_iterable_dataset", False)):
+        return None
+
+    world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("ACCELERATE_NUM_PROCESSES") or 1)
+    world_size = max(world_size, 1)
+    per_device_batch_size = int(training_cfg["batch_size"])
+    grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
+    drop_last = bool(training_cfg.get("drop_last", True))
+    global_micro_batch = max(per_device_batch_size * world_size, 1)
+    train_rows = int(train_info["num_rows"])
+
+    if drop_last:
+        micro_steps_per_epoch = train_rows // global_micro_batch
+    else:
+        micro_steps_per_epoch = math.ceil(train_rows / global_micro_batch)
+
+    if micro_steps_per_epoch <= 0:
+        raise ValueError("Computed zero training steps per epoch; dataset is too small for the configured global batch size.")
+
+    optimizer_steps_per_epoch = max(1, math.ceil(micro_steps_per_epoch / grad_accum_steps))
+    num_epochs = float(training_cfg["epochs"])
+    return max(1, math.ceil(num_epochs * optimizer_steps_per_epoch))
 
 
 def deserialize_image_payload(payload: Any) -> Any:
     if payload is None or isinstance(payload, Image.Image):
         return payload
+    if isinstance(payload, (list, tuple)):
+        return [deserialize_image_payload(item) for item in payload]
+    if isinstance(payload, str):
+        with Image.open(payload) as image:
+            return image.convert("RGB").copy()
     if isinstance(payload, dict):
         if payload.get("bytes") is not None:
             with Image.open(BytesIO(payload["bytes"])) as image:
@@ -325,7 +414,7 @@ def build_data_collator(model: SentenceTransformer) -> BaseDataCollator:
 def load_sentence_transformers_datasets(cfg: Dict[str, Any]):
     data_cfg = cfg["data"]
     allowed_modalities = data_cfg.get("allowed_modalities")
-    use_iterable_dataset = bool(data_cfg.get("use_iterable_dataset", False))
+    train_use_iterable_dataset = bool(data_cfg.get("use_iterable_dataset", False))
     if data_cfg.get("cache_dir"):
         raise ValueError(
             "cache_dir is not supported by the native Sentence Transformers trainer path. "
@@ -341,10 +430,11 @@ def load_sentence_transformers_datasets(cfg: Dict[str, Any]):
         query_modalities=data_cfg.get("query_modalities"),
         positive_modalities=data_cfg.get("positive_modalities"),
         negative_modalities=data_cfg.get("negative_modalities"),
-        as_iterable=use_iterable_dataset,
+        as_iterable=train_use_iterable_dataset,
     )
 
     validation_cfg = cfg.get("validation", {})
+    eval_use_iterable_dataset = bool(validation_cfg.get("use_iterable_dataset", False))
     eval_dataset = None
     eval_info = None
     if validation_cfg.get("cache_dir"):
@@ -362,7 +452,8 @@ def load_sentence_transformers_datasets(cfg: Dict[str, Any]):
             query_modalities=data_cfg.get("query_modalities"),
             positive_modalities=data_cfg.get("positive_modalities"),
             negative_modalities=data_cfg.get("negative_modalities"),
-            as_iterable=use_iterable_dataset,
+            as_iterable=eval_use_iterable_dataset,
+            max_records=validation_cfg.get("max_rows"),
         )
 
     return train_dataset, train_info, eval_dataset, eval_info
@@ -389,20 +480,34 @@ def write_status(output_dir: str, payload: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    configure_unbuffered_output()
     parser = argparse.ArgumentParser(description="Native Sentence Transformers multimodal training")
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
 
+    log_progress(f"[startup] loading config from {args.config}")
     cfg = load_yaml(args.config)
     set_seed(int(cfg.get("seed", 42)))
     st_version = require_sentence_transformers_version()
+    log_progress(f"[startup] sentence-transformers version {st_version}")
 
+    log_progress("[startup] loading datasets")
     train_dataset, train_info, eval_dataset, eval_info = load_sentence_transformers_datasets(cfg)
+    log_progress(
+        f"[startup] loaded train dataset with {train_info['num_rows']} rows and modalities {train_info['modalities']}"
+    )
+    if eval_info is not None:
+        log_progress(
+            f"[startup] loaded eval dataset with {eval_info['num_rows']} rows and modalities {eval_info['modalities']}"
+        )
+
+    log_progress(f"[startup] loading model {cfg['model']['model_name']}")
     model = build_model(cfg)
     validate_modalities(model, train_info)
     if eval_info is not None:
         validate_modalities(model, eval_info)
+    log_progress("[startup] model loaded and modalities validated")
 
     if train_info["num_negatives_present"] and not train_info["has_uniform_negatives"]:
         print(
@@ -410,11 +515,18 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    resolved_max_steps = resolve_training_max_steps(cfg, train_info)
+    if resolved_max_steps is not None:
+        cfg.setdefault("training", {})["max_steps"] = resolved_max_steps
+        log_progress(f"[startup] resolved max_steps={resolved_max_steps} for iterable training")
+
+    log_progress("[startup] building loss, evaluator, training arguments, and collator")
     loss = build_loss(model, cfg)
     evaluator = build_evaluator(eval_dataset, cfg)
     training_args = build_training_args(cfg)
     data_collator = build_data_collator(model)
 
+    log_progress("[startup] constructing trainer")
     trainer = NativeSentenceTransformerTrainer(
         model=model,
         args=training_args,
@@ -425,7 +537,9 @@ def main() -> None:
         data_collator=data_collator,
     )
 
+    log_progress("[startup] starting training")
     train_result = trainer.train(resume_from_checkpoint=args.resume or None)
+    log_progress("[startup] training finished, saving final model")
     trainer.save_model(os.path.join(cfg["output_dir"], "final"))
 
     metrics = dict(train_result.metrics)
@@ -444,6 +558,7 @@ def main() -> None:
             }
         )
     write_status(cfg["output_dir"], metrics)
+    log_progress(f"[done] wrote status to {os.path.join(cfg['output_dir'], 'train_status.json')}")
 
 
 if __name__ == "__main__":

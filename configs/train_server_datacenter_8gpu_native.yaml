@@ -21,8 +21,8 @@ training:
   warmup_ratio: 0.1
   max_grad_norm: 1.0
   mixed_precision: bf16
-  num_workers: 4
-  log_every: 10
+  num_workers: 0
+  log_every: 1
   save_every: 2000
   save_total_limit: 2
   eval_every: 2000
@@ -31,7 +31,7 @@ loss:
   type: cached_mnrl
   scale: 20.0
   mini_batch_size: 1
-  matryoshka_dims: [2048, 1536, 1024, 512, 256, 128, 64]
+  matryoshka_dims: [1024, 768, 512, 256, 128, 64]
 
 data:
   manifest_path: /scratch/2dmse-data/server_full/train_manifest.jsonl
@@ -39,8 +39,10 @@ data:
   audio_root: /scratch/2dmse-data/server_full/audio
   allow_missing_negative: true
   allowed_modalities: [text, image]
+  use_iterable_dataset: true
 
 validation:
   manifest_path: /scratch/2dmse-data/server_full/val_manifest.jsonl
   batch_size: 1
+  max_rows: 2048
   name: server-datacenter-native-ir

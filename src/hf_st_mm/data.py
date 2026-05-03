@@ -1,11 +1,11 @@
 import json
+import math
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
-from datasets import Dataset, Features, Value
-from PIL import Image
+from datasets import Dataset, Features, IterableDataset, Value
 
 
 SUPPORTED_MODALITIES = {"text", "image", "audio"}
@@ -77,38 +77,16 @@ class JsonlManifestDataset:
         self.image_root = image_root
         self.audio_root = audio_root
         self.allow_missing_negative = allow_missing_negative
-        self.records = self._load_records()
-
-    def _resolve_media(self, item: PairItem) -> PairItem:
-        if item.modality == "image" and self.image_root and not os.path.isabs(item.value):
-            return PairItem(item.modality, os.path.join(self.image_root, item.value))
-        if item.modality == "audio" and self.audio_root and not os.path.isabs(item.value):
-            return PairItem(item.modality, os.path.join(self.audio_root, item.value))
-        return item
-
-    def _load_records(self) -> List[TrainRecord]:
-        if not os.path.exists(self.manifest_path):
-            raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
-
-        records: List[TrainRecord] = []
-        with open(self.manifest_path, "r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                raw = json.loads(line)
-                rec = parse_record(raw)
-                rec = TrainRecord(
-                    query=self._resolve_media(rec.query),
-                    positive=self._resolve_media(rec.positive),
-                    negative=self._resolve_media(rec.negative) if rec.negative else None,
-                )
-                if rec.negative is None and not self.allow_missing_negative:
-                    raise ValueError(f"Missing negative at line {line_no}")
-                records.append(rec)
-        if not records:
+        self.records = list(
+            iter_manifest_records(
+                manifest_path=self.manifest_path,
+                image_root=self.image_root,
+                audio_root=self.audio_root,
+                allow_missing_negative=self.allow_missing_negative,
+            )
+        )
+        if not self.records:
             raise ValueError(f"No records loaded from {self.manifest_path}")
-        return records
 
     def __len__(self) -> int:
         return len(self.records)
@@ -188,18 +166,54 @@ class CachedShardDataset:
         )
 
 
-class RawSentenceTransformersIterableDataset(torch.utils.data.IterableDataset):
-    def __init__(self, rows: List[Dict[str, Any]]) -> None:
-        super().__init__()
-        self.rows = rows
-        self.column_names = list(rows[0].keys()) if rows else []
-        self.features = Features({key: Value("null") for key in self.column_names})
+def _process_shard() -> tuple[int, int]:
+    rank = int(os.environ.get("ACCELERATE_PROCESS_INDEX") or os.environ.get("RANK") or 0)
+    world_size = int(os.environ.get("WORLD_SIZE") or os.environ.get("ACCELERATE_NUM_PROCESSES") or 1)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return rank, max(world_size, 1)
 
-    def __iter__(self):
-        yield from self.rows
+    total_shards = max(world_size, 1) * worker_info.num_workers
+    shard_id = rank * worker_info.num_workers + worker_info.id
+    return shard_id, max(total_shards, 1)
 
-    def __len__(self) -> int:
-        return len(self.rows)
+
+def iter_sentence_transformers_rows(
+    manifest_path: str,
+    image_root: Optional[str],
+    audio_root: Optional[str],
+    allow_missing_negative: bool,
+    allowed_modalities: Optional[List[str]],
+    query_modalities: Optional[List[str]],
+    positive_modalities: Optional[List[str]],
+    negative_modalities: Optional[List[str]],
+    use_negative_column: bool,
+):
+    allowed = set(allowed_modalities or [])
+    allowed_query = set(query_modalities or [])
+    allowed_positive = set(positive_modalities or [])
+    allowed_negative = set(negative_modalities or [])
+    shard_id, total_shards = _process_shard()
+    matched_index = 0
+
+    for record in iter_manifest_records(
+        manifest_path=manifest_path,
+        image_root=image_root,
+        audio_root=audio_root,
+        allow_missing_negative=allow_missing_negative,
+    ):
+        if not record_matches_filters(
+            record,
+            allowed=allowed,
+            allowed_query=allowed_query,
+            allowed_positive=allowed_positive,
+            allowed_negative=allowed_negative,
+        ):
+            continue
+
+        if matched_index % total_shards == shard_id:
+            yield record_to_sentence_transformers_row(record, include_negative=use_negative_column)
+        matched_index += 1
 
 
 def collate_records(batch: List[TrainRecord]) -> Dict[str, List[PairItem]]:
@@ -216,13 +230,138 @@ def sentence_transformers_input(item: PairItem) -> Any:
         payload["text"] = item.value
         return payload
     if item.modality == "image":
-        with Image.open(item.value) as image:
-            payload["image"] = image.convert("RGB").copy()
-            return payload
+        payload["image"] = item.value
+        return payload
     if item.modality == "audio":
         payload["audio"] = item.value
         return payload
     return item.value
+
+
+def resolve_media(item: PairItem, image_root: Optional[str], audio_root: Optional[str]) -> PairItem:
+    if item.modality == "image" and image_root and not os.path.isabs(item.value):
+        return PairItem(item.modality, os.path.join(image_root, item.value))
+    if item.modality == "audio" and audio_root and not os.path.isabs(item.value):
+        return PairItem(item.modality, os.path.join(audio_root, item.value))
+    return item
+
+
+def iter_manifest_records(
+    manifest_path: str,
+    image_root: Optional[str] = None,
+    audio_root: Optional[str] = None,
+    allow_missing_negative: bool = True,
+) -> Iterable[TrainRecord]:
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            raw = json.loads(line)
+            record = parse_record(raw)
+            record = TrainRecord(
+                query=resolve_media(record.query, image_root, audio_root),
+                positive=resolve_media(record.positive, image_root, audio_root),
+                negative=resolve_media(record.negative, image_root, audio_root) if record.negative else None,
+            )
+            if record.negative is None and not allow_missing_negative:
+                raise ValueError(f"Missing negative at line {line_no}")
+            yield record
+
+
+def record_matches_filters(
+    record: TrainRecord,
+    allowed: set[str],
+    allowed_query: set[str],
+    allowed_positive: set[str],
+    allowed_negative: set[str],
+) -> bool:
+    record_modalities = {record.query.modality, record.positive.modality}
+    if record.negative is not None:
+        record_modalities.add(record.negative.modality)
+    if allowed and not record_modalities.issubset(allowed):
+        return False
+    if allowed_query and record.query.modality not in allowed_query:
+        return False
+    if allowed_positive and record.positive.modality not in allowed_positive:
+        return False
+    if record.negative is not None and allowed_negative and record.negative.modality not in allowed_negative:
+        return False
+    return True
+
+
+def record_to_sentence_transformers_row(record: TrainRecord, include_negative: bool) -> Dict[str, Any]:
+    row = {
+        "query": sentence_transformers_input(record.query),
+        "positive": sentence_transformers_input(record.positive),
+    }
+    if include_negative and record.negative is not None:
+        row["negative_0"] = sentence_transformers_input(record.negative)
+    return row
+
+
+def summarize_manifest_records(
+    manifest_path: str,
+    image_root: Optional[str] = None,
+    audio_root: Optional[str] = None,
+    allow_missing_negative: bool = True,
+    allowed_modalities: Optional[List[str]] = None,
+    query_modalities: Optional[List[str]] = None,
+    positive_modalities: Optional[List[str]] = None,
+    negative_modalities: Optional[List[str]] = None,
+    max_records: Optional[int] = None,
+) -> Dict[str, Any]:
+    modalities = set()
+    negatives_present = 0
+    negatives_missing = 0
+    skipped_rows = 0
+    num_rows = 0
+    allowed = set(allowed_modalities or [])
+    allowed_query = set(query_modalities or [])
+    allowed_positive = set(positive_modalities or [])
+    allowed_negative = set(negative_modalities or [])
+
+    for record in iter_manifest_records(
+        manifest_path=manifest_path,
+        image_root=image_root,
+        audio_root=audio_root,
+        allow_missing_negative=allow_missing_negative,
+    ):
+        if not record_matches_filters(
+            record,
+            allowed=allowed,
+            allowed_query=allowed_query,
+            allowed_positive=allowed_positive,
+            allowed_negative=allowed_negative,
+        ):
+            skipped_rows += 1
+            continue
+
+        modalities.add(record.query.modality)
+        modalities.add(record.positive.modality)
+        if record.negative is not None:
+            modalities.add(record.negative.modality)
+            negatives_present += 1
+        else:
+            negatives_missing += 1
+        num_rows += 1
+        if max_records is not None and num_rows >= max_records:
+            break
+
+    if num_rows == 0:
+        raise ValueError(f"No records loaded from {manifest_path}")
+
+    return {
+        "modalities": sorted(modalities),
+        "num_rows": num_rows,
+        "has_uniform_negatives": negatives_present > 0 and negatives_missing == 0,
+        "num_negatives_present": negatives_present,
+        "num_negatives_missing": negatives_missing,
+        "skipped_rows": skipped_rows,
+    }
 
 
 def manifest_to_sentence_transformers_dataset(
@@ -235,73 +374,64 @@ def manifest_to_sentence_transformers_dataset(
     positive_modalities: Optional[List[str]] = None,
     negative_modalities: Optional[List[str]] = None,
     as_iterable: bool = False,
-) -> tuple[Dataset | RawSentenceTransformersIterableDataset, Dict[str, Any]]:
-    dataset = JsonlManifestDataset(
+    max_records: Optional[int] = None,
+) -> tuple[Dataset | IterableDataset, Dict[str, Any]]:
+    info = summarize_manifest_records(
         manifest_path=manifest_path,
         image_root=image_root,
         audio_root=audio_root,
         allow_missing_negative=allow_missing_negative,
+        allowed_modalities=allowed_modalities,
+        query_modalities=query_modalities,
+        positive_modalities=positive_modalities,
+        negative_modalities=negative_modalities,
+        max_records=max_records,
     )
 
-    rows: List[Dict[str, Any]] = []
-    modalities = set()
-    negatives_present = 0
-    negatives_missing = 0
-    skipped_rows = 0
-    allowed = set(allowed_modalities or [])
-    allowed_query = set(query_modalities or [])
-    allowed_positive = set(positive_modalities or [])
-    allowed_negative = set(negative_modalities or [])
-
-    for record in dataset.records:
-        record_modalities = {record.query.modality, record.positive.modality}
-        if record.negative is not None:
-            record_modalities.add(record.negative.modality)
-        if allowed and not record_modalities.issubset(allowed):
-            skipped_rows += 1
-            continue
-        if allowed_query and record.query.modality not in allowed_query:
-            skipped_rows += 1
-            continue
-        if allowed_positive and record.positive.modality not in allowed_positive:
-            skipped_rows += 1
-            continue
-        if record.negative is not None and allowed_negative and record.negative.modality not in allowed_negative:
-            skipped_rows += 1
-            continue
-
-        row = {
-            "query": sentence_transformers_input(record.query),
-            "positive": sentence_transformers_input(record.positive),
-        }
-        modalities.add(record.query.modality)
-        modalities.add(record.positive.modality)
-
-        if record.negative is not None:
-            row["negative_0"] = sentence_transformers_input(record.negative)
-            modalities.add(record.negative.modality)
-            negatives_present += 1
-        else:
-            negatives_missing += 1
-
-        rows.append(row)
-
-    use_negative_column = negatives_present > 0 and negatives_missing == 0
-    if negatives_present > 0 and negatives_missing > 0:
-        for row in rows:
-            row.pop("negative_0", None)
-
-    dataset_out: Dataset | RawSentenceTransformersIterableDataset
+    dataset_out: Dataset | IterableDataset
     if as_iterable:
-        dataset_out = RawSentenceTransformersIterableDataset(rows)
+        column_names = ["query", "positive"]
+        if info["has_uniform_negatives"]:
+            column_names.append("negative_0")
+        dataset_out = IterableDataset.from_generator(
+            iter_sentence_transformers_rows,
+            features=Features({key: Value("null") for key in column_names}),
+            gen_kwargs={
+                "manifest_path": manifest_path,
+                "image_root": image_root,
+                "audio_root": audio_root,
+                "allow_missing_negative": allow_missing_negative,
+                "allowed_modalities": allowed_modalities,
+                "query_modalities": query_modalities,
+                "positive_modalities": positive_modalities,
+                "negative_modalities": negative_modalities,
+                "use_negative_column": info["has_uniform_negatives"],
+            },
+        )
     else:
+        dataset = JsonlManifestDataset(
+            manifest_path=manifest_path,
+            image_root=image_root,
+            audio_root=audio_root,
+            allow_missing_negative=allow_missing_negative,
+        )
+        allowed = set(allowed_modalities or [])
+        allowed_query = set(query_modalities or [])
+        allowed_positive = set(positive_modalities or [])
+        allowed_negative = set(negative_modalities or [])
+        rows: List[Dict[str, Any]] = []
+        for record in dataset.records:
+            if not record_matches_filters(
+                record,
+                allowed=allowed,
+                allowed_query=allowed_query,
+                allowed_positive=allowed_positive,
+                allowed_negative=allowed_negative,
+            ):
+                continue
+            rows.append(record_to_sentence_transformers_row(record, include_negative=info["has_uniform_negatives"]))
+            if max_records is not None and len(rows) >= max_records:
+                break
         dataset_out = Dataset.from_list(rows)
 
-    return dataset_out, {
-        "modalities": sorted(modalities),
-        "num_rows": len(rows),
-        "has_uniform_negatives": use_negative_column,
-        "num_negatives_present": negatives_present,
-        "num_negatives_missing": negatives_missing,
-        "skipped_rows": skipped_rows,
-    }
+    return dataset_out, info
