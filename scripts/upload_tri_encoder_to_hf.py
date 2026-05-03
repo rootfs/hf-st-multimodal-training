@@ -122,9 +122,26 @@ def prepare_upload_bundle(final_dir: str, repo_id: str, metrics: Dict[str, float
 def upload_folder(folder_path: str, repo_id: str, token: str, commit_message: str) -> None:
     ensure_hf_hub_installed()
     from huggingface_hub import HfApi, create_repo
+    from huggingface_hub.errors import HfHubHTTPError
 
-    create_repo(repo_id, repo_type="model", exist_ok=True, token=token)
-    HfApi().upload_folder(
+    api = HfApi()
+    try:
+        create_repo(repo_id, repo_type="model", exist_ok=True, token=token)
+    except HfHubHTTPError as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code != 403:
+            raise
+
+        try:
+            api.repo_info(repo_id=repo_id, repo_type="model", token=token)
+        except Exception as repo_exc:
+            raise PermissionError(
+                f"Token cannot create or access model repo '{repo_id}'. "
+                "Pre-create the repo under that namespace or use a token with the required org permissions."
+            ) from repo_exc
+
+    api.upload_folder(
         folder_path=folder_path,
         repo_id=repo_id,
         repo_type="model",

@@ -92,6 +92,7 @@ If you want the Hugging Face ST stack long-term for the datacenter path, the pra
 - `configs/accelerate_8gpu.yaml`: Accelerate multi-GPU config
 - `configs/train_server_datacenter_8gpu_native.yaml`: Native Sentence Transformers config for the datacenter-scale run
 - `configs/train_server_datacenter_8gpu_cached.yaml`: Cached datacenter tri-encoder config for the main datacenter embedder
+- `MULTI_NODE_3x8GPU_PLAN.md`: Recommended rollout plan for the datacenter tri-encoder on 3 nodes x 8 GPUs
 - `scripts/train_st_multimodal.py`: Main training entrypoint
 - `scripts/validate_dataset.py`: Manifest/media validator
 - `scripts/run_docker_train.sh`: End-to-end Docker launch helper

@@ -34,11 +34,38 @@ model-index:
 
 `__MODEL_NAME__` is the large production multimodal embedding model from the [llm-semantic-router](https://huggingface.co/llm-semantic-router) project.
 
-It is designed for routing, retrieval, and cross-modal matching across text, image, and audio rather than for generative chat. The model uses a tri-encoder architecture with separate text, image, and audio towers projected into a shared embedding space.
+It is designed for routing, retrieval, and cross-modal matching across text, image, and audio rather than for generative chat. The model uses a tri-encoder architecture with separate text, image, and audio towers projected into one shared embedding space.
 
-## Model Description
+## Purpose
 
-This release packages the large routing-grade tri-encoder trained in PyTorch with the server training stack from this repository.
+This release exists to provide a large multimodal embedding model for production systems where inputs may arrive as text, screenshots or images, and audio. It is built for semantic routing, multimodal retrieval, and cross-modal similarity.
+
+## What Is In This Repository
+
+This repository contains the minimum artifacts needed to load and run the exported model:
+
+- `model.pt`: trained weights for the final exported model
+- `config.json`: model configuration and encoder names
+- `src/hf_st_mm/...`: the Python source package used to construct and run the tri-encoder
+- `README.md`: this model card, including usage examples and validation summary
+
+This is not a generic Hugging Face Transformers checkpoint with a built-in auto-class loader. It is a packaged custom PyTorch model export.
+
+## Advantages And Innovation
+
+Most multimodal models are optimized for generation, captioning, or chat. This model is optimized for embeddings and operational use.
+
+What is different here:
+
+- map text, image, and audio into one shared semantic space
+- support routing and retrieval instead of text generation
+- preserve a strong multilingual text backbone
+- use stronger modality-specific encoders instead of forcing every modality into one monolithic checkpoint
+- support production training and evaluation on cached shard datasets
+
+## Model Overview
+
+This release packages the large routing-grade tri-encoder trained in PyTorch with the server training stack from this project.
 
 Architecture:
 
@@ -55,27 +82,7 @@ Training characteristics:
 - target hardware: AMD MI300X
 - data pipeline: cached tensor shards with sequential shard loading and worker-local prefetch
 
-## Intended Use
-
-This model is intended for:
-
-- semantic routing
-- multimodal retrieval
-- matching text to images or audio
-- embedding user inputs from different modalities into one shared space
-
-This model is not a native `AutoModel.from_pretrained(...)` multimodal checkpoint. It is a custom tri-encoder exported as:
-
-- `model.pt`
-- `config.json`
-- `src/hf_st_mm/...` source package for loading and inference
-
-## Validation Snapshot
-
-At upload time, the final export was evaluated with the repository's tri-encoder evaluator.
-
-- `eval_loss`: `__EVAL_LOSS__`
-- `eval_top1`: `__EVAL_TOP1__`
+## How To Use It
 
 ## Installation
 
@@ -85,7 +92,7 @@ pip install torch sentence-transformers transformers accelerate safetensors pill
 
 ## Python Usage
 
-The easiest way to use this model in Python is to download the full repository snapshot for the model, add the packaged `src/` directory to `sys.path`, and load the tri-encoder from `model.pt` and `config.json`.
+The simplest way to use the model is to download the repository snapshot, load the packaged source code, and then encode one or more modality-tagged items.
 
 ```python
 import json
@@ -116,13 +123,9 @@ model = MultiModalSentenceEmbedder(
 state_dict = torch.load(os.path.join(local_dir, "model.pt"), map_location="cpu")
 model.load_state_dict(state_dict)
 model.eval()
-```
 
-### Encode Text, Image, and Audio
-
-```python
 items = [
-    PairItem(modality="text", value="route this request to the billing team"),
+  PairItem(modality="text", value="route this request to the billing team"),
     PairItem(modality="image", value="/path/to/screenshot.png"),
     PairItem(modality="audio", value="/path/to/call.wav"),
 ]
@@ -131,11 +134,7 @@ with torch.no_grad():
     embeddings = model.encode_items(items)
 
 print(embeddings.shape)  # [3, __EMBEDDING_DIM__]
-```
 
-### Compare Similarity Across Modalities
-
-```python
 import torch.nn.functional as F
 
 query = PairItem(modality="text", value="refund request for wrong charge")
@@ -148,7 +147,14 @@ similarity = F.cosine_similarity(embs[0:1], embs[1:2]).item()
 print(f"similarity={similarity:.4f}")
 ```
 
-## Notes
+## Validation Snapshot
+
+At upload time, the final export was evaluated with the repository's tri-encoder evaluator.
+
+- `eval_loss`: `__EVAL_LOSS__`
+- `eval_top1`: `__EVAL_TOP1__`
+
+## Practical Notes
 
 - Text inputs can be provided as raw strings or tokenized features.
 - Image and audio inputs can be provided as file paths.
