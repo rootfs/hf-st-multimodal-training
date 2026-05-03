@@ -5,10 +5,10 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/scratch/2dmse-data/server_full}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-/workspace/app/configs/train_server_datacenter_8gpu_native.yaml}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-/workspace/app/configs/train_server_datacenter_8gpu_cached.yaml}"
 ACCEL_CONFIG="${ACCEL_CONFIG:-/workspace/app/configs/accelerate_8gpu.yaml}"
 LLAVA_ROOT="${LLAVA_ROOT:-/scratch/2dmse-data/server/llava-cc3m-595k}"
-OUTPUT_DIR_HOST="${OUTPUT_DIR_HOST:-/scratch/hf_st_mm_outputs/server_datacenter_8gpu}"
+OUTPUT_DIR_HOST="${OUTPUT_DIR_HOST:-/scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder}"
 
 export NCCL_ALGO=Ring
 export NCCL_PROTO=Simple

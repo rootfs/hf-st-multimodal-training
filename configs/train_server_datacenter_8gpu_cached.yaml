@@ -1,5 +1,5 @@
 seed: 42
-output_dir: /scratch/hf_st_mm_outputs/server_datacenter_8gpu
+output_dir: /scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder
 
 model:
   text_encoder_name: llm-semantic-router/mmbert-embed-32k-2d-matryoshka
@@ -12,6 +12,13 @@ training:
   epochs: 10
   batch_size: 12
   grad_accum_steps: 8
+  num_workers: 4
+  prefetch_factor: 4
+  shard_prefetch: 2
+  shard_cache_limit: 4
+  sequential_shard_loading: true
+  shuffle: false
+  modality_homogeneous_batches: false
   learning_rate: 1.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.1
@@ -30,3 +37,6 @@ data:
 
 validation:
   cache_dir: /scratch/2dmse-data/server_full_datacenter_cache/val
+  num_workers: 2
+  shard_prefetch: 1
+  shard_cache_limit: 2

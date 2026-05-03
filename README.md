@@ -2,7 +2,10 @@
 
 Standalone training project for server-scale multimodal embeddings on AMD MI300X using Docker + ROCm + Hugging Face tooling.
 
-The training entrypoint now uses the native Sentence Transformers multimodal trainer stack (`SentenceTransformer`, `SentenceTransformerTrainer`, `CachedMultipleNegativesRankingLoss`, `InformationRetrievalEvaluator`) instead of the previous custom tri-encoder loop.
+The training entrypoint supports two execution paths:
+
+- native Sentence Transformers multimodal training for single-checkpoint multimodal models such as Qwen3-VL
+- datacenter tri-encoder training for the main mmBERT + SigLIP2 + Whisper embedding stack
 
 This project is intentionally isolated so it can be moved into a new git repo.
 
@@ -14,11 +17,81 @@ The bundled example configs use `Qwen/Qwen3-VL-Embedding-2B`, which is a text+im
 
 If you want to train on audio too, replace `model.model_name` with an audio-capable native multimodal checkpoint and expand `data.allowed_modalities` accordingly.
 
+## Datacenter tri-encoder path
+
+The main datacenter embedding model is supported through the same `scripts/train_st_multimodal.py` entrypoint when the config provides the tri-encoder model triplet plus cached shard directories:
+
+- text encoder: `llm-semantic-router/mmbert-embed-32k-2d-matryoshka`
+- image encoder: `google/siglip2-so400m-patch14-384`
+- audio encoder: `openai/whisper-medium`
+- train/eval data: `data.cache_dir` and `validation.cache_dir`
+
+Use [configs/train_server_datacenter_8gpu_cached.yaml](/root/2DMSE-Multimodal-Embedder/hf-st-multimodal-server/configs/train_server_datacenter_8gpu_cached.yaml) for the original datacenter model and [configs/train_server_datacenter_8gpu_native.yaml](/root/2DMSE-Multimodal-Embedder/hf-st-multimodal-server/configs/train_server_datacenter_8gpu_native.yaml) for the newer native Sentence Transformers path.
+
+The datacenter tri-encoder path consumes encoder-specific tensor shards created by `scripts/preprocess_manifest_cache.py`. Those shards are tied to the production encoder triplet and are not interchangeable with smaller smoke encoders or the native Qwen path.
+
+## Datacenter cached-training investigation
+
+The datacenter tri-encoder run was investigated specifically for low and bursty GPU utilization on MI300X.
+
+What was confirmed:
+
+- the intended production model is the mmBERT + SigLIP2 + Whisper tri-encoder, not the native Qwen example path
+- the cached dataset startup regression was real and was fixed by switching back to metadata-driven shard sizing instead of eager full-shard loads at startup
+- simple DataLoader tuning alone was not enough to stabilize utilization
+- the old repo's cached tensor shard prefetch idea only helps when the training loop consumes shards sequentially
+
+What is now implemented in this repo:
+
+- fast metadata-driven cached dataset startup
+- detailed unbuffered startup and train logging
+- ETA progress bar in the tri-encoder training loop
+- worker-local cached shard prefetch support
+- sequential shard loading option for the cached tri-encoder path
+- the datacenter cached config defaults to sequential shard loading with `shuffle: false` so all ranks start from comparable modality regions instead of diverging into image-only versus mixed-modality shards
+
+Why `shuffle: false` matters here:
+
+- the cached corpus is not uniformly mixed across all shards
+- later shard regions become heavily skewed toward image-only or image+audio query mixes
+- when shard order was globally shuffled, different ranks started from very different modality regions and step time regressed badly
+- keeping shard order aligned across ranks preserves comparable per-rank work while still letting each rank process a different shard subset
+
+Current recommendation for the production datacenter cached run:
+
+- use [configs/train_server_datacenter_8gpu_cached.yaml](/root/2DMSE-Multimodal-Embedder/hf-st-multimodal-server/configs/train_server_datacenter_8gpu_cached.yaml)
+- keep sequential shard loading enabled for the cached tri-encoder path
+- keep global shard shuffle disabled unless a shard-modality balancing scheme is added first
+- treat DataLoader `prefetch_factor` as a secondary tuning knob; the primary control is matching the loader access pattern to shard-prefetch behavior
+
+## What to do with Hugging Face Sentence Transformers
+
+The investigation clarified the boundary between the native Sentence Transformers library and the production datacenter cached path.
+
+Use native Sentence Transformers when:
+
+- you have a single multimodal checkpoint exposed as `model.model_name`
+- the model can preprocess raw examples at training time
+- your dataset can be represented as raw `query` / `positive` / optional `negative_0` examples
+
+Do not try to force the production cached tri-encoder shards into `SentenceTransformerTrainer` directly:
+
+- those shards contain encoder-specific tensors tied to the mmBERT + SigLIP2 + Whisper triplet
+- they are not a portable raw-example format
+- the native ST trainer expects raw multimodal examples, not already-encoded per-encoder cache payloads
+
+If you want the Hugging Face ST stack long-term for the datacenter path, the practical options are:
+
+1. move to a true native multimodal checkpoint and train on raw manifests
+2. keep the custom tri-encoder training loop for the production cached path
+3. if ST support is required for cached training, build a custom trainer path around shard-sequential iterable loading rather than random-access global shuffling
+
 ## Project layout
 
 - `configs/train_server_native.yaml`: Native Sentence Transformers multimodal config for the smaller server dataset
 - `configs/accelerate_8gpu.yaml`: Accelerate multi-GPU config
 - `configs/train_server_datacenter_8gpu_native.yaml`: Native Sentence Transformers config for the datacenter-scale run
+- `configs/train_server_datacenter_8gpu_cached.yaml`: Cached datacenter tri-encoder config for the main datacenter embedder
 - `scripts/train_st_multimodal.py`: Main training entrypoint
 - `scripts/validate_dataset.py`: Manifest/media validator
 - `scripts/run_docker_train.sh`: End-to-end Docker launch helper
@@ -152,10 +225,18 @@ Default roots:
 
 The native trainer path no longer supports the older tensor cache built by `scripts/preprocess_manifest_cache.py`, because those shards contain encoder-specific preprocessed tensors from the previous custom tri-encoder implementation.
 
+That limitation only applies to the native path. If your config uses `text_encoder_name` / `image_encoder_name` / `audio_encoder_name` together with `cache_dir`, the training entrypoint automatically switches to the datacenter tri-encoder trainer.
+
 ## Direct launch command
 
 ```bash
 docker compose run --rm trainer bash -lc "accelerate launch --config_file /workspace/app/configs/accelerate_8gpu.yaml /workspace/app/scripts/train_st_multimodal.py --config /workspace/app/configs/train_server_native.yaml"
+```
+
+Original datacenter tri-encoder launch:
+
+```bash
+docker compose run --rm trainer bash -lc "accelerate launch --config_file /workspace/app/configs/accelerate_8gpu.yaml /workspace/app/scripts/train_st_multimodal.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml"
 ```
 
 ## Notes for MI300X
