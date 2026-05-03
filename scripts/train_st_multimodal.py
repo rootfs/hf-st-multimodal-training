@@ -759,8 +759,17 @@ def evaluate_tri_encoder_model(
     model.eval()
     eval_losses = []
     eval_top1 = []
+    eval_progress = None
+    if accelerator.is_main_process:
+        eval_progress = tqdm(
+            eval_loader,
+            desc="eval",
+            leave=False,
+            dynamic_ncols=True,
+        )
+    eval_iterable = eval_progress if eval_progress is not None else eval_loader
     with torch.no_grad():
-        for batch in eval_loader:
+        for batch in eval_iterable:
             anchor, positive = _encode_query_positive_batch(model, batch["query"], batch["positive"])
             loss = multiple_negatives_ranking_loss(anchor, positive, scale=scale)
             scores = torch.matmul(anchor, positive.T)
@@ -771,6 +780,15 @@ def evaluate_tri_encoder_model(
             gathered_top1 = accelerator.gather_for_metrics(top1.detach().reshape(1))
             eval_losses.append(gathered_loss.float().mean().item())
             eval_top1.append(gathered_top1.float().mean().item())
+
+            if eval_progress is not None:
+                eval_progress.set_postfix(
+                    loss=f"{sum(eval_losses) / len(eval_losses):.4f}",
+                    top1=f"{sum(eval_top1) / len(eval_top1):.4f}",
+                )
+
+    if eval_progress is not None:
+        eval_progress.close()
 
     model.train()
     if not eval_losses:
