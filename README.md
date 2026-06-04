@@ -92,11 +92,13 @@ If you want the Hugging Face ST stack long-term for the datacenter path, the pra
 - `configs/accelerate_8gpu.yaml`: Accelerate multi-GPU config
 - `configs/train_server_datacenter_8gpu_native.yaml`: Native Sentence Transformers config for the datacenter-scale run
 - `configs/train_server_datacenter_8gpu_cached.yaml`: Cached datacenter tri-encoder config for the main datacenter embedder
+- `configs/accelerate_2node_16gpu.yaml`: Accelerate config template for 2 nodes x 8 GPUs (16 total ranks)
 - `MULTI_NODE_3x8GPU_PLAN.md`: Recommended rollout plan for the datacenter tri-encoder on 3 nodes x 8 GPUs
 - `scripts/train_st_multimodal.py`: Main training entrypoint
 - `scripts/validate_dataset.py`: Manifest/media validator
 - `scripts/run_docker_train.sh`: End-to-end Docker launch helper
 - `scripts/run_server_datacenter_pipeline.sh`: Full resumable server-size dataset/cache/train pipeline
+- `scripts/run_datacenter_multinode_train.sh`: Multi-node training launcher (run on every node with node-specific rank)
 
 ## Dataset contract
 
@@ -239,6 +241,44 @@ Original datacenter tri-encoder launch:
 ```bash
 docker compose run --rm trainer bash -lc "accelerate launch --config_file /workspace/app/configs/accelerate_8gpu.yaml /workspace/app/scripts/train_st_multimodal.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml"
 ```
+
+## Multi-node launch (2 nodes x 8 GPUs)
+
+The trainer already reads distributed rank and world-size from Accelerate or torchrun env vars. To extend single-node runs to multi-node, keep the same training config and only change launch/rendezvous arguments.
+
+1. Ensure the same container image, code revision, and dataset cache paths are available on both nodes.
+1. Choose a rendezvous endpoint on node0 (private network).
+1. Run the launcher below on both nodes with different `MACHINE_RANK` values.
+
+Node0:
+
+```bash
+MASTER_ADDR=<node0_private_ip> \
+MASTER_PORT=29500 \
+MACHINE_RANK=0 \
+NUM_MACHINES=2 \
+GPUS_PER_NODE=8 \
+bash scripts/run_datacenter_multinode_train.sh
+```
+
+Node1:
+
+```bash
+MASTER_ADDR=<node0_private_ip> \
+MASTER_PORT=29500 \
+MACHINE_RANK=1 \
+NUM_MACHINES=2 \
+GPUS_PER_NODE=8 \
+bash scripts/run_datacenter_multinode_train.sh
+```
+
+Optional overrides:
+
+- `TRAIN_CONFIG` to point at a different train YAML
+- `ACCEL_CONFIG` to point at a different accelerate YAML
+- `OUTPUT_DIR_HOST` for checkpoint discovery/resume path
+
+For 3 nodes x 8 GPUs, see [MULTI_NODE_3x8GPU_PLAN.md](./MULTI_NODE_3x8GPU_PLAN.md).
 
 ## Evaluating checkpoints and final models
 
