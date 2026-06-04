@@ -92,11 +92,15 @@ If you want the Hugging Face ST stack long-term for the datacenter path, the pra
 - `configs/accelerate_8gpu.yaml`: Accelerate multi-GPU config
 - `configs/train_server_datacenter_8gpu_native.yaml`: Native Sentence Transformers config for the datacenter-scale run
 - `configs/train_server_datacenter_8gpu_cached.yaml`: Cached datacenter tri-encoder config for the main datacenter embedder
+- `configs/accelerate_2node_16gpu.yaml`: Accelerate config template for 2 nodes x 8 GPUs (16 total ranks)
 - `MULTI_NODE_3x8GPU_PLAN.md`: Recommended rollout plan for the datacenter tri-encoder on 3 nodes x 8 GPUs
 - `scripts/train_st_multimodal.py`: Main training entrypoint
 - `scripts/validate_dataset.py`: Manifest/media validator
 - `scripts/run_docker_train.sh`: End-to-end Docker launch helper
 - `scripts/run_server_datacenter_pipeline.sh`: Full resumable server-size dataset/cache/train pipeline
+- `scripts/run_datacenter_multinode_train.sh`: Multi-node training launcher (run on every node with node-specific rank)
+- `REPO_FLOW.md`: Concise operational flow map and artifact handoff reference
+- `workflows/full_repo_operational_flow_localization.sh`: Reusable full-repo operational-flow localization report generator
 
 ## Dataset contract
 
@@ -239,6 +243,78 @@ Original datacenter tri-encoder launch:
 ```bash
 docker compose run --rm trainer bash -lc "accelerate launch --config_file /workspace/app/configs/accelerate_8gpu.yaml /workspace/app/scripts/train_st_multimodal.py --config /workspace/app/configs/train_server_datacenter_8gpu_cached.yaml"
 ```
+
+## Multi-node launch (2 nodes x 8 GPUs)
+
+The datacenter cached path assumes all nodes can see the same cache contract:
+
+- train cache: `${TRAIN_CACHE_DIR_HOST}` containing `metadata.json` and `shard_*.pt`
+- validation cache: `${VAL_CACHE_DIR_HOST}` containing `metadata.json` and `shard_*.pt`
+- shared output/resume root: `${OUTPUT_DIR_HOST}` for `checkpoint-*`, `final/`, and `train_status.json`
+
+The launcher now enforces these assumptions before `accelerate launch`:
+
+- both cache roots must exist and contain metadata + shards
+- node0 writes a readiness marker in `${OUTPUT_DIR_HOST}`
+- non-zero ranks block until the marker is visible (fails fast when output path is not actually shared)
+
+### Required stage ordering
+
+Use this exact sequence for multi-node cached training:
+
+1. **Data download/build**: run `scripts/download_real_data.py` or `scripts/run_server_datacenter_pipeline.sh` for manifests/media.
+2. **Cache preprocess**: build `train`/`val` shard caches with `scripts/preprocess_manifest_cache.py`.
+3. **Validation**: verify manifests/media with `scripts/validate_dataset.py` and verify cache roots contain `metadata.json` + `shard_*.pt`.
+4. **Node0 launch**: start rank 0 first (writes readiness marker + rendezvous endpoint).
+5. **Other nodes launch**: start remaining ranks after node0 marker appears.
+6. **Checkpoint/resume**: all nodes point at the same `OUTPUT_DIR_HOST` so auto-resume sees the latest shared checkpoint.
+
+### Data-sharing strategies
+
+Pick one strategy and keep it consistent for an entire run:
+
+1. **Shared filesystem (default in scripts)**: every node mounts identical host paths for cache/output.
+2. **Replicated local cache per node**: each node keeps a local copy, but you still must mount it to the same in-container path and keep shard metadata identical.
+3. **Partitioned local cache (fallback)**: split shard IDs per node only if full replication is impossible; keep deterministic shard ordering and identical world-size/rank topology.
+
+Choose a rendezvous endpoint on node0 (private network), then run the launcher below on both nodes with different `MACHINE_RANK` values.
+
+Node0:
+
+```bash
+MASTER_ADDR=<node0_private_ip> \
+MASTER_PORT=29500 \
+MACHINE_RANK=0 \
+NUM_MACHINES=2 \
+GPUS_PER_NODE=8 \
+TRAIN_CACHE_DIR_HOST=/scratch/2dmse-data/server_full_datacenter_cache/train \
+VAL_CACHE_DIR_HOST=/scratch/2dmse-data/server_full_datacenter_cache/val \
+OUTPUT_DIR_HOST=/scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder \
+bash scripts/run_datacenter_multinode_train.sh
+```
+
+Node1:
+
+```bash
+MASTER_ADDR=<node0_private_ip> \
+MASTER_PORT=29500 \
+MACHINE_RANK=1 \
+NUM_MACHINES=2 \
+GPUS_PER_NODE=8 \
+TRAIN_CACHE_DIR_HOST=/scratch/2dmse-data/server_full_datacenter_cache/train \
+VAL_CACHE_DIR_HOST=/scratch/2dmse-data/server_full_datacenter_cache/val \
+OUTPUT_DIR_HOST=/scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder \
+bash scripts/run_datacenter_multinode_train.sh
+```
+
+Optional overrides:
+
+- `TRAIN_CONFIG` to point at a different train YAML
+- `ACCEL_CONFIG` to point at a different accelerate YAML
+- `WAIT_FOR_NODE0_READY_SECONDS` to control non-zero-rank readiness wait timeout
+- `NODE0_READY_MARKER` to override the default readiness marker location
+
+For 3 nodes x 8 GPUs, see [MULTI_NODE_3x8GPU_PLAN.md](./MULTI_NODE_3x8GPU_PLAN.md).
 
 ## Evaluating checkpoints and final models
 

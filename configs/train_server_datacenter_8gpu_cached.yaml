@@ -40,3 +40,11 @@ validation:
   num_workers: 2
   shard_prefetch: 1
   shard_cache_limit: 2
+
+multinode:
+  data_sharing_strategy: shared-fs
+  cache_ready_contract:
+    train_cache_dir_host: /scratch/2dmse-data/server_full_datacenter_cache/train
+    val_cache_dir_host: /scratch/2dmse-data/server_full_datacenter_cache/val
+  checkpoint_contract:
+    output_dir_host: /scratch/hf_st_mm_outputs/server_datacenter_8gpu_tri_encoder
