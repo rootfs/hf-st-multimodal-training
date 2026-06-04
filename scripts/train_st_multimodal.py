@@ -918,7 +918,14 @@ def run_datacenter_tri_encoder_training(cfg: Dict[str, Any], resume_path: Option
         start_epoch = resume_state["epoch"]
         resume_batch_in_epoch = resume_state["micro_step_in_epoch"]
         global_step = resume_state["global_step"]
-        if resume_batch_in_epoch >= len(train_loader):
+        if use_sequential_shard_loading:
+            batches_per_epoch = train_dataset.estimated_num_batches(
+                batch_size=int(training_cfg["batch_size"]),
+                drop_last=bool(training_cfg.get("drop_last", True)),
+            )
+        else:
+            batches_per_epoch = len(train_loader)
+        if resume_batch_in_epoch >= batches_per_epoch:
             start_epoch += 1
             resume_batch_in_epoch = 0
 
